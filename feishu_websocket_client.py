@@ -23,6 +23,9 @@ VERIFICATION_TOKEN = ""
 # 消息队列
 message_queue = Queue()
 
+# 已处理消息ID集合（用于去重）
+processed_message_ids = set()
+
 class FeishuWebSocketClient:
     def __init__(self, app_id, app_secret):
         self.app_id = app_id
@@ -35,13 +38,28 @@ class FeishuWebSocketClient:
         """处理接收到的消息事件"""
         try:
             print(f"[Feishu] 📨 Received message event")
-            print(f"[Feishu] Data: {lark.JSON.marshal(data, indent=2)}")
 
             # 解析消息
             event = data.event
             if event and hasattr(event, 'message'):
+                message_id = event.message.message_id
+
+                # 检查是否已处理过（去重）
+                if message_id in processed_message_ids:
+                    print(f"[Feishu] ⏭️  Skipping duplicate message: {message_id}")
+                    return
+
+                # 标记为已处理
+                processed_message_ids.add(message_id)
+
+                # 限制集合大小（最多保留10000条）
+                if len(processed_message_ids) > 10000:
+                    # 移除最旧的1000条
+                    for old_id in list(processed_message_ids)[:1000]:
+                        processed_message_ids.remove(old_id)
+
                 message = {
-                    'message_id': event.message.message_id,
+                    'message_id': message_id,
                     'sender_id': event.sender.sender_id.open_id,
                     'sender_type': event.sender.sender_type,
                     'message_type': event.message.message_type,

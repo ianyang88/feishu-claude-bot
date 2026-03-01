@@ -135,6 +135,13 @@ COMMAND_PERMISSIONS = {
         description="删除项目",
         examples=["delproj myapp"]
     ),
+    "clear": CommandPermission(
+        command="clear",
+        operation_type=OperationType.SAFE,
+        min_permission=PermissionLevel.STANDARD,
+        description="清理未处理消息和历史记录",
+        examples=["clear", "reset"]
+    ),
 }
 
 # ==================== Reaction选择器 ====================
@@ -362,12 +369,59 @@ class AuthorizationManager:
         """
         处理用户确认消息
 
+        支持两种格式:
+        1. 简单格式: "确认"/"取消" - 针对最新待处理请求
+        2. 完整格式: "confirm <request_id>" / "reject <request_id>"
+
         Returns:
             (approved, message, auth_request)
         """
-        parts = message.strip().split()
+        message = message.strip()
+
+        # 简单格式: 确认/取消 (针对最新待处理请求)
+        if message in ['确认', '取消', 'confirm', 'cancel', 'yes', 'no', 'y', 'n']:
+            # 获取该用户最新的待处理请求
+            latest_request = None
+            for req_id, req in self.auth_requests.pending_requests.items():
+                if req.sender_id == sender_id and req.status == "pending":
+                    if not latest_request or req.created_at > latest_request.created_at:
+                        latest_request = req
+
+            if not latest_request:
+                return False, "❌ 没有待处理的授权请求", None
+
+            # 判断操作类型
+            is_approve = message in ['确认', 'confirm', 'yes', 'y']
+            request_id = latest_request.request_id
+
+            if is_approve:
+                success = self.auth_requests.approve_request(request_id)
+                if success:
+                    self.audit_logger.log_operation(
+                        sender_id, chat_id=latest_request.chat_id,
+                        command=latest_request.command, args=latest_request.args,
+                        operation_type=latest_request.operation_type,
+                        status="auth_approved",
+                        metadata={"request_id": latest_request.request_id}
+                    )
+                    return True, f"✅ 授权已批准，执行命令: {latest_request.command}", latest_request
+                else:
+                    return False, "❌ 授权请求已过期", None
+            else:
+                self.auth_requests.reject_request(request_id)
+                self.audit_logger.log_operation(
+                    sender_id, chat_id=latest_request.chat_id,
+                    command=latest_request.command, args=latest_request.args,
+                    operation_type=latest_request.operation_type,
+                    status="auth_rejected",
+                    metadata={"request_id": latest_request.request_id}
+                )
+                return False, "❌ 授权已拒绝", latest_request
+
+        # 完整格式: confirm/reject <request_id>
+        parts = message.split()
         if len(parts) < 2:
-            return False, "❌ 无效的确认格式，使用: confirm <request_id>", None
+            return False, "❌ 无效格式，回复'确认'批准或'取消'拒绝", None
 
         action = parts[0].lower()
         request_id = parts[1]
@@ -405,7 +459,7 @@ class AuthorizationManager:
             return False, "❌ 授权已拒绝", request
 
         else:
-            return False, f"❌ 未知操作: {action}，使用 confirm 或 reject", None
+            return False, f"❌ 未知操作: {action}，回复'确认'批准或'取消'拒绝", None
 
     def _generate_auth_request_message(self, request: AuthRequest) -> str:
         """生成授权请求消息"""
@@ -422,11 +476,13 @@ class AuthorizationManager:
 
 命令: {request.command} {request.args}
 操作类型: {request.operation_type.value}
-请求ID: {request.request_id}
 超时时间: {timeout_sec} 秒
 
 ⚠️ 此操作需要您的授权确认
-回复以下消息确认:
+
+💬 回复「确认」批准，「取消」拒绝
+
+或使用完整格式:
   confirm {request.request_id}  - 执行操作
   reject {request.request_id}   - 取消操作"""
 
@@ -508,7 +564,7 @@ class ClaudeCLIClient:
         self.cli_path = cli_path
         self.working_dir = working_dir
 
-    def chat(self, message: str, conversation_history: List[dict] = None) -> Optional[str]:
+    def chat(self, message: str, conversation_history: List[dict] = None, timeout: int = 120) -> Optional[str]:
         """调用Claude CLI处理消息"""
 
         try:
@@ -534,7 +590,7 @@ class ClaudeCLIClient:
                 cwd=self.working_dir,
                 capture_output=True,
                 text=True,
-                timeout=60,  # 1分钟超时
+                timeout=timeout,  # 可配置超时时间
                 env=os.environ.copy()
             )
 
@@ -551,6 +607,91 @@ class ClaudeCLIClient:
         except subprocess.TimeoutExpired:
             print(f"[❌] Claude CLI执行超时")
             return None
+        except Exception as e:
+            print(f"[❌] 调用Claude CLI异常: {str(e)}")
+            return None
+
+    def chat_streaming(self, message: str, on_chunk: callable, conversation_history: List[dict] = None, timeout: int = 120) -> Optional[str]:
+        """流式调用Claude CLI，每行输出都触发on_chunk回调
+
+        Args:
+            message: 用户消息
+            on_chunk: 回调函数，接收累积的输出内容
+            conversation_history: 对话历史
+            timeout: 超时时间（秒）
+
+        Returns:
+            str: 完整的Claude回复，失败返回None
+        """
+        try:
+            # 构建完整提示
+            full_prompt = self._build_prompt(message, conversation_history)
+            concise_prompt = f"{full_prompt}\n\n请简洁、自然地回复（1-2句话，不要过度解释或提供多个选项）。"
+
+            # 调用Claude CLI
+            cmd = [
+                self.cli_path,
+                "--print",
+                "--dangerously-skip-permissions",
+                concise_prompt
+            ]
+
+            print(f"[🤖] 调用Claude CLI（流式模式）...")
+            print(f"[📝] 输入: {message[:100]}..." if len(message) > 100 else f"[📝] 输入: {message}")
+
+            # 使用Popen实现流式读取
+            process = subprocess.Popen(
+                cmd,
+                cwd=self.working_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,  # 行缓冲
+                env=os.environ.copy()
+            )
+
+            accumulated = []
+            last_chunk_time = time.time()
+
+            try:
+                # 逐行读取输出
+                for line in iter(process.stdout.readline, ''):
+                    if line:
+                        stripped_line = line.rstrip('\n\r')
+                        if stripped_line:  # 只添加非空行
+                            accumulated.append(stripped_line)
+                            current_content = '\n'.join(accumulated)
+
+                            # 触发回调（至少每0.1秒一次）
+                            now = time.time()
+                            if now - last_chunk_time >= 0.1:
+                                on_chunk(current_content)
+                                last_chunk_time = now
+
+                # 等待进程结束
+                process.wait(timeout=timeout)
+
+                # 最终回调
+                final_content = '\n'.join(accumulated)
+                if final_content:
+                    on_chunk(final_content)
+
+                if process.returncode == 0:
+                    print(f"[✅] Claude回复（流式）: {final_content[:100]}..." if len(final_content) > 100 else f"[✅] Claude回复（流式）: {final_content}")
+                    return final_content
+                else:
+                    stderr_output = process.stderr.read()
+                    print(f"[❌] Claude CLI执行失败")
+                    print(f"[错误] 返回码: {process.returncode}")
+                    print(f"[stderr] {stderr_output}")
+                    return None
+
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+                print(f"[❌] Claude CLI执行超时")
+                return None
+
         except Exception as e:
             print(f"[❌] 调用Claude CLI异常: {str(e)}")
             return None
@@ -601,6 +742,21 @@ class ClaudeCLIClient:
 
 # ==================== 飞书客户端 ====================
 
+class ThrottledUpdater:
+    """节流更新器，避免频繁调用 API"""
+
+    def __init__(self, update_func: callable, interval: float = 0.5):
+        self.update_func = update_func
+        self.interval = interval
+        self.last_update = 0
+
+    def update(self, content: str):
+        now = time.time()
+        if now - self.last_update >= self.interval:
+            self.update_func(content)
+            self.last_update = now
+
+
 class FeishuClient:
     """飞书客户端"""
 
@@ -609,6 +765,7 @@ class FeishuClient:
         self.app_secret = app_secret
         self.tenant_access_token = None
         self.token_expire_time = 0
+        self._card_sequence = {}  # 卡片序号管理
 
     def get_tenant_access_token(self) -> str:
         """获取tenant_access_token"""
@@ -721,6 +878,135 @@ class FeishuClient:
             print(f"[错误] 发送reaction异常: {str(e)}")
             import traceback
             print(f"[TRACEBACK] {traceback.format_exc()}")
+            return False
+
+    def _get_next_sequence(self, message_id: str) -> int:
+        """获取并递增卡片操作序号"""
+        if message_id not in self._card_sequence:
+            self._card_sequence[message_id] = 0
+        self._card_sequence[message_id] += 1
+        return self._card_sequence[message_id]
+
+    def _build_card_content(self, title: str, content: str) -> dict:
+        """构建飞书卡片内容"""
+        return {
+            "config": {
+                "wide_screen_mode": True
+            },
+            "header": {
+                "title": {
+                    "content": title,
+                    "tag": "plain_text"
+                }
+            },
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": content
+                    }
+                }
+            ]
+        }
+
+    def create_and_send_card(self, chat_id: str, content: str, title: str = "🤖 Claude") -> Optional[str]:
+        """创建并发送卡片消息到聊天，返回 message_id
+
+        Args:
+            chat_id: 聊天ID
+            content: 卡片内容（Markdown格式）
+            title: 卡片标题
+
+        Returns:
+            message_id: 成功返回消息ID，失败返回None
+        """
+        try:
+            token = self.get_tenant_access_token()
+            if not token:
+                print("[错误] 获取tenant_access_token失败")
+                return None
+
+            url = "https://open.feishu.cn/open-apis/im/v1/messages"
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            }
+
+            # 构建卡片内容
+            card_data = self._build_card_content(title, content)
+
+            payload = {
+                "receive_id": chat_id,
+                "msg_type": "interactive",
+                "content": json.dumps(card_data, ensure_ascii=False)
+            }
+
+            response = requests.post(
+                f"{url}?receive_id_type=chat_id",
+                headers=headers,
+                json=payload,
+                timeout=10
+            )
+
+            data = response.json()
+            if data.get("code") == 0:
+                message_id = data.get("data", {}).get("message_id")
+                print(f"[✅] 卡片消息已发送: {message_id}")
+                return message_id
+            else:
+                print(f"[❌] 发送卡片消息失败: {data}")
+                return None
+
+        except Exception as e:
+            print(f"[错误] 发送卡片消息异常: {str(e)}")
+            return None
+
+    def update_card_message(self, message_id: str, content: str, title: str = "🤖 Claude") -> bool:
+        """更新卡片消息内容
+
+        Args:
+            message_id: 消息ID
+            content: 新的卡片内容（Markdown格式）
+            title: 卡片标题
+
+        Returns:
+            bool: 成功返回True，失败返回False
+        """
+        try:
+            token = self.get_tenant_access_token()
+            if not token:
+                print("[错误] 获取tenant_access_token失败")
+                return False
+
+            url = f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}"
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            }
+
+            # 构建卡片内容
+            card_data = self._build_card_content(title, content)
+
+            payload = {
+                "msg_type": "interactive",
+                "content": json.dumps(card_data, ensure_ascii=False)
+            }
+
+            response = requests.patch(url, headers=headers, json=payload, timeout=10)
+            data = response.json()
+
+            if data.get("code") == 0:
+                # 序号递增（用于调试）
+                sequence = self._get_next_sequence(message_id)
+                print(f"[✅] 卡片更新成功 (序号: {sequence})")
+                return True
+            else:
+                print(f"[❌] 更新卡片失败: {data}")
+                return False
+
+        except Exception as e:
+            print(f"[错误] 更新卡片异常: {str(e)}")
             return False
 
 
@@ -893,20 +1179,32 @@ class MessageProcessor:
         if message in ['help', '帮助']:
             return True, 'help', ''
 
+        # clear 命令
+        if message in ['clear', 'reset', '清理', '重置']:
+            return True, 'clear', ''
+
         return False, None, ''
 
     def is_confirmation_message(self, message: str) -> tuple[bool, Optional[str]]:
         """
         判断是否为授权确认消息
 
+        支持简单格式: "确认"/"取消"
+        支持完整格式: "confirm <id>" / "reject <id>"
+
         Returns:
             (is_confirmation, action)
         """
-        message = message.strip().lower()
+        message_lower = message.strip().lower()
 
-        if message.startswith('confirm ') or message.startswith('批准 '):
+        # 简单格式: 确认/取消 (单次回复)
+        if message_lower in ['确认', '取消', 'confirm', 'cancel', 'yes', 'no', 'y', 'n']:
+            return True, 'simple'
+
+        # 完整格式: confirm/reject <request_id>
+        if message_lower.startswith('confirm ') or message_lower.startswith('批准 '):
             return True, 'confirm'
-        elif message.startswith('reject ') or message.startswith('拒绝 '):
+        elif message_lower.startswith('reject ') or message_lower.startswith('拒绝 '):
             return True, 'reject'
 
         return False, None
@@ -1049,6 +1347,48 @@ class MessageProcessor:
             except Exception as e:
                 return f"❌ 创建目录失败：{str(e)}"
 
+        elif command_type == 'clear':
+            # 清理未处理消息和对话历史
+            cleared_items = []
+
+            # 1. 清理消息队列文件
+            if os.path.exists(MESSAGE_FILE):
+                try:
+                    # 获取消息数量
+                    with open(MESSAGE_FILE, 'r') as f:
+                        msg_count = sum(1 for line in f if line.strip())
+
+                    # 清空文件
+                    open(MESSAGE_FILE, 'w').close()
+                    cleared_items.append(f"消息队列 ({msg_count} 条)")
+                except Exception as e:
+                    return f"❌ 清理消息队列失败：{str(e)}"
+
+            # 2. 清理当前聊天的对话历史
+            if chat_id in self.conversation_history:
+                history_count = len(self.conversation_history[chat_id])
+                del self.conversation_history[chat_id]
+                cleared_items.append(f"对话历史 ({history_count} 条)")
+
+            # 3. 可选：清理已处理记录（保留最近100条）
+            if os.path.exists(PROCESSED_FILE):
+                try:
+                    with open(PROCESSED_FILE, 'r') as f:
+                        lines = f.readlines()
+
+                    if len(lines) > 100:
+                        # 保留最近100条
+                        with open(PROCESSED_FILE, 'w') as f:
+                            f.writelines(lines[-100:])
+                        cleared_items.append(f"已处理记录 (保留最近100条)")
+                except Exception as e:
+                    return f"❌ 清理已处理记录失败：{str(e)}"
+
+            if cleared_items:
+                return f"✅ 已清理：\n" + "\n".join(f"  • {item}" for item in cleared_items) + "\n\n对话已重置到干净状态"
+            else:
+                return "✅ 无需清理，已经是干净状态"
+
         elif command_type == 'help':
             return """🤖 飞书Claude Bot 控制命令
 
@@ -1065,6 +1405,9 @@ class MessageProcessor:
   ls [path]                 列出目录内容
   mkdir <path>              创建新目录
 
+🔄 状态管理：
+  clear / reset             清理未处理消息和历史记录
+
 💡 使用示例：
   projects                  查看所有项目
   use openclaw              切换到 openclaw 项目
@@ -1074,7 +1417,8 @@ class MessageProcessor:
   cd ~/projects             切换到项目目录
   cd ..                    返回上级目录
   pwd                      查看当前目录
-  ls                       列出当前目录"""
+  ls                       列出当前目录
+  clear                    清理所有待处理消息"""
 
         return "❌ 未知命令"
 
@@ -1229,25 +1573,63 @@ class MessageProcessor:
                         if is_first_conversation:
                             print("[🎉] 检测到首次对话")
 
-                        # 调用本地Claude CLI
-                        response = self.claude.chat(text_content, history)
+                        # 尝试使用卡片流式更新
+                        # 1. 创建并发送卡片（返回message_id）
+                        message_id_for_card = self.feishu.create_and_send_card(chat_id, "🤖 正在思考...")
 
-                        if response:
-                            # 发送回复到飞书
-                            success = self.feishu.send_message(chat_id, response)
+                        if message_id_for_card:
+                            # 2. 定义更新回调
+                            def update_card(content: str):
+                                self.feishu.update_card_message(message_id_for_card, content)
 
-                            if success:
+                            # 3. 节流更新器（0.5秒间隔）
+                            updater = ThrottledUpdater(update_card, interval=0.5)
+
+                            # 4. 流式处理
+                            response = self.claude.chat_streaming(
+                                text_content,
+                                lambda c: updater.update(c),
+                                conversation_history=history,
+                                timeout=120
+                            )
+
+                            # 5. 最终更新
+                            if response:
+                                updater.update(response)
                                 # 保存到对话历史
                                 self.add_to_history(chat_id, "user", text_content)
                                 self.add_to_history(chat_id, "assistant", response)
 
                                 # 标记为已处理
                                 self.save_processed_id(message_id)
-                                print("\n✅ 消息处理完成\n")
+                                print("\n✅ 消息处理完成（卡片模式）\n")
                             else:
-                                print("\n❌ 发送回复失败\n")
+                                # 失败时更新卡片显示错误
+                                self.feishu.update_card_message(message_id_for_card, "❌ Claude CLI调用失败")
+                                print("\n❌ Claude CLI调用失败\n")
                         else:
-                            print("\n❌ Claude CLI调用失败\n")
+                            # 回退到普通消息模式
+                            print("[回退] 卡片创建失败，使用普通消息模式")
+                            self.feishu.send_message(chat_id, "🔄 正在处理...")
+
+                            response = self.claude.chat(text_content, history, timeout=120)
+
+                            if response:
+                                # 发送回复到飞书
+                                success = self.feishu.send_message(chat_id, response)
+
+                                if success:
+                                    # 保存到对话历史
+                                    self.add_to_history(chat_id, "user", text_content)
+                                    self.add_to_history(chat_id, "assistant", response)
+
+                                    # 标记为已处理
+                                    self.save_processed_id(message_id)
+                                    print("\n✅ 消息处理完成（普通模式）\n")
+                                else:
+                                    print("\n❌ 发送回复失败\n")
+                            else:
+                                print("\n❌ Claude CLI调用失败\n")
 
                         # 短暂延迟，避免过度消耗资源
                         time.sleep(0.5)
@@ -1303,9 +1685,11 @@ class MessageProcessor:
                 if os.path.exists(MESSAGE_FILE):
                     current_size = os.path.getsize(MESSAGE_FILE)
 
-                    if current_size > last_size:
-                        print(f"🔔 检测到新消息...")
-                        self.process_messages()
+                    # 文件大小变化（变大或变小）都需要处理
+                    if current_size != last_size:
+                        if current_size > 0:
+                            print(f"🔔 检测到新消息...")
+                            self.process_messages()
                         last_size = current_size
 
                 time.sleep(check_interval)
