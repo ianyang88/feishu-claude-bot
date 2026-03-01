@@ -99,6 +99,42 @@ COMMAND_PERMISSIONS = {
         description="显示帮助信息",
         examples=["help"]
     ),
+    # 项目管理命令
+    "projects": CommandPermission(
+        command="projects",
+        operation_type=OperationType.SENSITIVE_READ,
+        min_permission=PermissionLevel.RESTRICTED,
+        description="列出所有项目",
+        examples=["projects", "proj"]
+    ),
+    "use": CommandPermission(
+        command="use",
+        operation_type=OperationType.SAFE,
+        min_permission=PermissionLevel.RESTRICTED,
+        description="切换到指定项目",
+        examples=["use openclaw", "use fcb"]
+    ),
+    "search": CommandPermission(
+        command="search",
+        operation_type=OperationType.SENSITIVE_READ,
+        min_permission=PermissionLevel.RESTRICTED,
+        description="搜索项目",
+        examples=["search bot", "search claude"]
+    ),
+    "addproj": CommandPermission(
+        command="addproj",
+        operation_type=OperationType.MODERATE,
+        min_permission=PermissionLevel.STANDARD,
+        description="添加新项目",
+        examples=["addproj myapp ~/projects/my-app"]
+    ),
+    "delproj": CommandPermission(
+        command="delproj",
+        operation_type=OperationType.MODERATE,
+        min_permission=PermissionLevel.STANDARD,
+        description="删除项目",
+        examples=["delproj myapp"]
+    ),
 }
 
 # ==================== Reaction选择器 ====================
@@ -582,7 +618,7 @@ class FeishuClient:
                 "app_id": self.app_id,
                 "app_secret": self.app_secret
             }
-            response = requests.post(url, json=payload)
+            response = requests.post(url, json=payload, timeout=10)
             data = response.json()
 
             if data.get("code") == 0:
@@ -616,7 +652,8 @@ class FeishuClient:
             response = requests.post(
                 f"{url}?receive_id_type=chat_id",
                 headers=headers,
-                json=payload
+                json=payload,
+                timeout=10
             )
 
             data = response.json()
@@ -1080,6 +1117,11 @@ class MessageProcessor:
                     try:
                         msg = json.loads(line)
                         message_id = msg.get('message_id')
+
+                        # 跳过无效消息（缺少必需字段）
+                        if not message_id:
+                            print(f"[跳过] 无效消息（缺少 message_id）: {line.strip()[:100]}")
+                            continue
 
                         # 跳过已处理的消息
                         if message_id in self.processed_ids:

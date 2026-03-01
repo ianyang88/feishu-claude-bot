@@ -44,7 +44,7 @@ class FeishuWebSocketClient:
                     'message_id': event.message.message_id,
                     'sender_id': event.sender.sender_id.open_id,
                     'sender_type': event.sender.sender_type,
-                    'message_type': event.message.msg_type,
+                    'message_type': event.message.message_type,
                     'content': event.message.content,
                     'chat_id': event.message.chat_id,
                     'timestamp': int(time.time() * 1000),
