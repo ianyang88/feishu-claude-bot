@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "feishu": {
+      "command": "node",
+      "args": [
+        "C:\\Users\\Admin\\feishu-mcp-server\\dist\\index.js"
+      ],
+      "env": {
+        "FEISHU_APP_ID": "cli_a9103ecc9fb85bd8",
+        "FEISHU_APP_SECRET": "qRyCROVPjtZDjCuZqDNIPdeWteHOnVck"
+      }
+    }
+  }
+}

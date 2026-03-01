@@ -1,0 +1,39 @@
+{
+  "name": "feishu-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server for Feishu (Lark) bot with WebSocket long connection",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "feishu-mcp-server": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc && node dist/index.js",
+    "watch": "tsc --watch"
+  },
+  "keywords": [
+    "mcp",
+    "feishu",
+    "lark",
+    "websocket",
+    "bot"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@larksuiteoapi/allcore": "^1.0.14",
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "axios": "^1.13.5",
+    "ws": "^8.19.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

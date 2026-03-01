@@ -9,6 +9,7 @@ import time
 import os
 import subprocess
 import random
+import fcntl
 from pathlib import Path
 from typing import Optional, List, Dict
 from enum import Enum
@@ -496,7 +497,7 @@ class ClaudeCLIClient:
                 cwd=self.working_dir,
                 capture_output=True,
                 text=True,
-                timeout=120,  # 2分钟超时
+                timeout=60,  # 1分钟超时
                 env=os.environ.copy()
             )
 
@@ -698,6 +699,7 @@ class MessageProcessor:
         # 工作目录管理
         self.chat_working_dirs = {}  # chat_id -> working_dir 映射
         self.default_working_dir = WORKING_DIR
+        self.processing_lock = None  # 处理锁文件
 
         # 初始化授权管理器
         self.auth_manager = AuthorizationManager(
@@ -713,14 +715,23 @@ class MessageProcessor:
                         if line.strip():
                             data = json.loads(line)
                             self.processed_ids.add(data['message_id'])
+                print(f"[加载] 已处理消息ID: {len(self.processed_ids)} 条")
             except Exception as e:
                 print(f"[警告] 加载已处理消息ID失败: {str(e)}")
 
     def save_processed_id(self, message_id: str):
-        """保存已处理的消息ID"""
+        """保存已处理的消息ID（使用原子写入）"""
         try:
-            with open(PROCESSED_FILE, 'a') as f:
+            # 使用原子写入避免文件损坏
+            temp_file = PROCESSED_FILE + ".tmp"
+            with open(temp_file, 'a') as f:
                 f.write(json.dumps({"message_id": message_id}) + '\n')
+                f.flush()
+                os.fsync(f.fileno())
+
+            # 重命名到目标文件（原子操作）
+            os.rename(temp_file, PROCESSED_FILE)
+
             self.processed_ids.add(message_id)
         except Exception as e:
             print(f"[错误] 保存已处理消息ID失败: {str(e)}")
@@ -945,9 +956,34 @@ class MessageProcessor:
 
         return "❌ 未知命令"
 
+    def _acquire_lock(self):
+        """获取处理锁，防止重复处理"""
+        lock_file = "/tmp/feishu_bot_processing.lock"
+        try:
+            self.processing_lock = open(lock_file, 'w')
+            fcntl.flock(self.processing_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except (IOError, OSError):
+            return False
+
+    def _release_lock(self):
+        """释放处理锁"""
+        if self.processing_lock:
+            try:
+                fcntl.flock(self.processing_lock.fileno(), fcntl.LOCK_UN)
+                self.processing_lock.close()
+            except:
+                pass
+            self.processing_lock = None
+
     def process_messages(self):
         """处理新消息"""
         if not os.path.exists(MESSAGE_FILE):
+            return
+
+        # 尝试获取处理锁，如果获取失败说明有其他进程正在处理
+        if not self._acquire_lock():
+            print("[跳过] 已有进程在处理消息")
             return
 
         try:
@@ -1087,7 +1123,7 @@ class MessageProcessor:
                             print("\n❌ Claude CLI调用失败\n")
 
                         # 短暂延迟，避免过度消耗资源
-                        time.sleep(2)
+                        time.sleep(0.5)
 
                     except json.JSONDecodeError as e:
                         print(f"[错误] JSON解析失败: {str(e)}")
@@ -1098,6 +1134,9 @@ class MessageProcessor:
 
         except Exception as e:
             print(f"[错误] 读取消息文件失败: {str(e)}")
+        finally:
+            # 释放处理锁
+            self._release_lock()
 
     def run(self):
         """运行消息处理循环"""
@@ -1124,7 +1163,7 @@ class MessageProcessor:
         print(f"✅ 已加载 {len(self.processed_ids)} 条已处理消息记录\n")
 
         # 监控循环
-        check_interval = 2  # 每2秒检查一次
+        check_interval = 1  # 每1秒检查一次
         print(f"👀 开始监听新消息 (检查间隔: {check_interval}秒)\n")
 
         last_size = 0
