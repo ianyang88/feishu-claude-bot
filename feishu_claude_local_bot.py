@@ -15,6 +15,7 @@ from typing import Optional, List, Dict
 from enum import Enum
 from dataclasses import dataclass
 import lark_oapi as lark
+from project_manager import ProjectManager
 from lark_oapi.api.im.v1 import (
     CreateMessageRequest, CreateMessageRequestBody,
     CreateMessageReactionRequest, CreateMessageReactionRequestBody
@@ -706,6 +707,9 @@ class MessageProcessor:
             audit_logger=AuditLogger("/tmp/feishu_audit.jsonl")
         )
 
+        # 初始化项目管理器
+        self.project_manager = ProjectManager()
+
     def load_processed_ids(self):
         """加载已处理的消息ID"""
         if os.path.exists(PROCESSED_FILE):
@@ -809,6 +813,26 @@ class MessageProcessor:
 
         message = message.strip()
 
+        # 项目管理命令
+        if message in ['projects', 'proj', '项目']:
+            return True, 'projects', ''
+
+        use_match = re.match(r'^use\s+(.+)$', message)
+        if use_match:
+            return True, 'use', use_match.group(1).strip()
+
+        addproj_match = re.match(r'^addproj\s+(.+)$', message)
+        if addproj_match:
+            return True, 'addproj', addproj_match.group(1).strip()
+
+        delproj_match = re.match(r'^delproj\s+(.+)$', message)
+        if delproj_match:
+            return True, 'delproj', delproj_match.group(1).strip()
+
+        search_match = re.match(r'^search\s+(.+)$', message)
+        if search_match:
+            return True, 'search', search_match.group(1).strip()
+
         # cd 命令
         cd_match = re.match(r'^cd\s+(.+)$', message)
         if cd_match:
@@ -852,7 +876,59 @@ class MessageProcessor:
 
     def handle_command(self, chat_id: str, command_type: str, args: str) -> str:
         """处理控制命令，返回命令执行结果"""
-        if command_type == 'cd':
+
+        # 项目管理命令
+        if command_type == 'projects':
+            current_dir = self.get_working_dir(chat_id)
+            return self.project_manager.format_list(current_path=current_dir)
+
+        elif command_type == 'use':
+            # 切换到项目
+            project = self.project_manager.get(args)
+            if not project:
+                # 尝试搜索
+                results = self.project_manager.search(args)
+                if results:
+                    if len(results) == 1:
+                        project = results[0]
+                    else:
+                        return f"❌ 找到多个匹配的项目：\n\n{self.project_manager.format_list(results)}"
+                else:
+                    return f"❌ 项目不存在：{args}\n\n使用 `projects` 查看所有项目"
+
+            success, message = self.set_working_dir(chat_id, project.path)
+            if success:
+                return f"✅ 已切换到项目：{project.name}\n{message}\n\n描述：{project.description or '无描述'}"
+            else:
+                return message
+
+        elif command_type == 'addproj':
+            # 添加项目
+            parts = args.split()
+            if len(parts) < 2:
+                return "❌ 格式错误，使用：addproj <名称> <路径> [别名...]"
+
+            name = parts[0]
+            path = parts[1]
+            alias = parts[2:] if len(parts) > 2 else []
+
+            success, message = self.project_manager.add(name, path, alias)
+            return message
+
+        elif command_type == 'delproj':
+            # 删除项目
+            success, message = self.project_manager.remove(args)
+            return message
+
+        elif command_type == 'search':
+            # 搜索项目
+            results = self.project_manager.search(args)
+            if not results:
+                return f"❌ 没有找到匹配 '{args}' 的项目"
+            return self.project_manager.format_list(results)
+
+        # 目录管理命令
+        elif command_type == 'cd':
             success, message = self.set_working_dir(chat_id, args)
             return message
 
@@ -939,20 +1015,29 @@ class MessageProcessor:
         elif command_type == 'help':
             return """🤖 飞书Claude Bot 控制命令
 
-📁 目录管理：
-  cd <path>     切换工作目录
-  pwd           显示当前工作目录
-  ls [path]     列出目录内容
-  mkdir <path>  创建新目录
+📁 项目管理：
+  projects / proj           列出所有项目
+  use <项目名或别名>         切换到指定项目
+  search <关键词>           搜索项目
+  addproj <名称> <路径>     添加新项目
+  delproj <项目名>          删除项目
+
+📂 目录管理：
+  cd <path>                 切换工作目录
+  pwd                       显示当前工作目录
+  ls [path]                 列出目录内容
+  mkdir <path>              创建新目录
 
 💡 使用示例：
-  cd ~/projects                  切换到项目目录
-  cd ..                           返回上级目录
-  pwd                             查看当前目录
-  ls                              列出当前目录
-  ls /tmp                         列出指定目录
-  mkdir new-project               在当前目录创建文件夹
-  mkdir ~/projects/my-project     创建绝对路径文件夹"""
+  projects                  查看所有项目
+  use openclaw              切换到 openclaw 项目
+  use oc                   使用别名切换
+  search bot               搜索包含 "bot" 的项目
+  addproj myapp ~/projects/my-app  添加新项目
+  cd ~/projects             切换到项目目录
+  cd ..                    返回上级目录
+  pwd                      查看当前目录
+  ls                       列出当前目录"""
 
         return "❌ 未知命令"
 
