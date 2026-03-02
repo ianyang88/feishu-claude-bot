@@ -623,6 +623,8 @@ class ClaudeCLIClient:
         Returns:
             str: 完整的Claude回复，失败返回None
         """
+        import select
+
         try:
             # 构建完整提示
             full_prompt = self._build_prompt(message, conversation_history)
@@ -652,11 +654,23 @@ class ClaudeCLIClient:
 
             accumulated = []
             last_chunk_time = time.time()
+            line_read_timeout = 30  # 单行读取超时30秒
 
             try:
-                # 逐行读取输出
-                for line in iter(process.stdout.readline, ''):
-                    if line:
+                # 使用select实现带超时的行读取，避免无限期阻塞
+                while True:
+                    # 检查进程是否已结束
+                    if process.poll() is not None:
+                        break
+
+                    # 使用select检查stdout是否有数据可读（超时30秒）
+                    readable, _, _ = select.select([process.stdout], [], [], line_read_timeout)
+
+                    if readable:
+                        # 有数据可读
+                        line = process.stdout.readline()
+                        if not line:  # EOF
+                            break
                         stripped_line = line.rstrip('\n\r')
                         if stripped_line:  # 只添加非空行
                             accumulated.append(stripped_line)
@@ -667,6 +681,12 @@ class ClaudeCLIClient:
                             if now - last_chunk_time >= 0.1:
                                 on_chunk(current_content)
                                 last_chunk_time = now
+                    else:
+                        # 读取超时 - 进程可能挂起
+                        print(f"[❌] Claude CLI行读取超时（{line_read_timeout}秒无输出）")
+                        process.kill()
+                        process.wait()
+                        return None
 
                 # 等待进程结束
                 process.wait(timeout=timeout)
