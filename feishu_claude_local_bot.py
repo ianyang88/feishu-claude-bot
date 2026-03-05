@@ -569,16 +569,14 @@ class ClaudeCLIClient:
 
         try:
             # 构建完整提示（包含历史对话上下文）
-            # 构建简洁的提示（添加简洁回复指令）
             full_prompt = self._build_prompt(message, conversation_history)
-            concise_prompt = f"{full_prompt}\n\n请简洁、自然地回复（1-2句话，不要过度解释或提供多个选项）。"
 
             # 调用Claude CLI（使用--print模式获取非交互式输出，跳过权限检查）
             cmd = [
                 self.cli_path,
                 "--print",
                 "--dangerously-skip-permissions",
-                concise_prompt
+                full_prompt
             ]
 
             print(f"[🤖] 调用Claude CLI...")
@@ -628,14 +626,13 @@ class ClaudeCLIClient:
         try:
             # 构建完整提示
             full_prompt = self._build_prompt(message, conversation_history)
-            concise_prompt = f"{full_prompt}\n\n请简洁、自然地回复（1-2句话，不要过度解释或提供多个选项）。"
 
             # 调用Claude CLI
             cmd = [
                 self.cli_path,
                 "--print",
                 "--dangerously-skip-permissions",
-                concise_prompt
+                full_prompt
             ]
 
             print(f"[🤖] 调用Claude CLI（流式模式）...")
@@ -653,57 +650,118 @@ class ClaudeCLIClient:
             )
 
             accumulated = []
+            stderr_buffer = []  # 收集stderr输出，防止buffer deadlock
             last_chunk_time = time.time()
-            line_read_timeout = 30  # 单行读取超时30秒
+            line_read_timeout = 120  # 单行读取超时120秒（复杂查询需要更长时间）
 
             try:
                 # 使用select实现带超时的行读取，避免无限期阻塞
+                stdout_complete = False
+                last_output_time = time.time()
+
                 while True:
-                    # 检查进程是否已结束
+                    # 先检查进程是否已结束
                     if process.poll() is not None:
+                        # 进程已结束，读取所有剩余输出
+                        remaining = process.stdout.read() if not process.stdout.closed else ''
+                        if remaining:
+                            for line in remaining.splitlines():
+                                line = line.rstrip('\n\r')
+                                if line:
+                                    accumulated.append(line)
                         break
 
-                    # 使用select检查stdout是否有数据可读（超时30秒）
-                    readable, _, _ = select.select([process.stdout], [], [], line_read_timeout)
+                    # 使用select检查stdout和stderr是否有数据可读
+                    readable, _, _ = select.select([process.stdout, process.stderr], [], [], 1.0)  # 1秒超时
 
                     if readable:
-                        # 有数据可读
-                        line = process.stdout.readline()
-                        if not line:  # EOF
+                        # 有数据可读，更新最后输出时间
+                        last_output_time = time.time()
+
+                        for stream in readable:
+                            if stream == process.stdout:
+                                line = process.stdout.readline()
+                                if line:  # 有数据
+                                    stripped_line = line.rstrip('\n\r')
+                                    accumulated.append(stripped_line)
+                                    current_content = '\n'.join(accumulated)
+
+                                    # 触发回调（至少每0.1秒一次）
+                                    now = time.time()
+                                    if now - last_chunk_time >= 0.1:
+                                        on_chunk(current_content)
+                                        last_chunk_time = now
+                                else:
+                                    # EOF，stdout 读取完成
+                                    print(f"[调试] 检测到 EOF，读取剩余输出")
+                                    # 读取所有剩余输出
+                                    remaining = process.stdout.read() if not process.stdout.closed else ''
+                                    if remaining:
+                                        for l in remaining.splitlines():
+                                            l = l.rstrip('\n\r')
+                                            if l:
+                                                accumulated.append(l)
+                                    stdout_complete = True
+                                    break  # 退出 for 循环
+                            elif stream == process.stderr:
+                                # 消费stderr防止buffer deadlock
+                                err_line = process.stderr.readline()
+                                if err_line:
+                                    stderr_buffer.append(err_line)
+                                    print(f"[stderr] {err_line.strip()}")
+
+                        # 如果 stdout 已完成，退出主循环
+                        if stdout_complete:
                             break
-                        stripped_line = line.rstrip('\n\r')
-                        if stripped_line:  # 只添加非空行
-                            accumulated.append(stripped_line)
-                            current_content = '\n'.join(accumulated)
-
-                            # 触发回调（至少每0.1秒一次）
-                            now = time.time()
-                            if now - last_chunk_time >= 0.1:
-                                on_chunk(current_content)
-                                last_chunk_time = now
                     else:
-                        # 读取超时 - 进程可能挂起
-                        print(f"[❌] Claude CLI行读取超时（{line_read_timeout}秒无输出）")
-                        process.kill()
-                        process.wait()
-                        return None
+                        # 没有数据可读
+                        # 检查是否长时间无输出（可能进程挂起）
+                        if time.time() - last_output_time > line_read_timeout:
+                            print(f"[警告] 进程无输出超时（{line_read_timeout}秒），检查进程状态")
+                            if process.poll() is not None:
+                                # 进程已结束，正常退出
+                                break
+                            else:
+                                # 进程还在运行但无输出，可能挂起
+                                print(f"[错误] 进程挂起，终止进程")
+                                process.kill()
+                                process.wait()
+                                return None
 
-                # 等待进程结束
-                process.wait(timeout=timeout)
+                # 确保所有剩余输出都被读取
+                if not stdout_complete:
+                    # 读取stdout的剩余内容
+                    try:
+                        remaining_output = process.stdout.read() if not process.stdout.closed else ''
+                        if remaining_output:
+                            for line in remaining_output.splitlines():
+                                line = line.rstrip('\n\r')
+                                if line:
+                                    accumulated.append(line)
+                    except:
+                        pass
 
                 # 最终回调
                 final_content = '\n'.join(accumulated)
                 if final_content:
                     on_chunk(final_content)
 
+                # 确保进程已被回收
+                if process.poll() is None:
+                    process.wait(timeout=5)
+
                 if process.returncode == 0:
                     print(f"[✅] Claude回复（流式）: {final_content[:100]}..." if len(final_content) > 100 else f"[✅] Claude回复（流式）: {final_content}")
+                    print(f"[调试] 完整内容长度: {len(final_content)} 字符, 行数: {len(accumulated)}")
                     return final_content
                 else:
-                    stderr_output = process.stderr.read()
+                    # 使用已收集的stderr buffer，并尝试读取剩余内容
+                    remaining_stderr = process.stderr.read() if not process.stderr.closed else ''
+                    stderr_output = ''.join(stderr_buffer) + remaining_stderr
                     print(f"[❌] Claude CLI执行失败")
                     print(f"[错误] 返回码: {process.returncode}")
-                    print(f"[stderr] {stderr_output}")
+                    if stderr_output:
+                        print(f"[stderr] {stderr_output}")
                     return None
 
             except subprocess.TimeoutExpired:
@@ -771,10 +829,24 @@ class ThrottledUpdater:
         self.last_update = 0
 
     def update(self, content: str):
+        """节流更新，只有超过间隔时间才会真正执行"""
         now = time.time()
         if now - self.last_update >= self.interval:
-            self.update_func(content)
+            self._safe_update(content)
             self.last_update = now
+
+    def force_update(self, content: str):
+        """强制更新，无视节流间隔（用于最终结果）"""
+        self._safe_update(content)
+        self.last_update = time.time()
+
+    def _safe_update(self, content: str):
+        """安全执行更新，捕获异常避免阻塞"""
+        try:
+            self.update_func(content)
+        except Exception as e:
+            print(f"[警告] 卡片更新失败: {str(e)}")
+            # 不抛出异常，避免阻塞流式处理
 
 
 class FeishuClient:
@@ -786,6 +858,7 @@ class FeishuClient:
         self.tenant_access_token = None
         self.token_expire_time = 0
         self._card_sequence = {}  # 卡片序号管理
+        self._card_update_keys = {}  # 卡片更新键管理 (message_id -> update_key)
 
     def get_tenant_access_token(self) -> str:
         """获取tenant_access_token"""
@@ -907,9 +980,24 @@ class FeishuClient:
         self._card_sequence[message_id] += 1
         return self._card_sequence[message_id]
 
-    def _build_card_content(self, title: str, content: str) -> dict:
-        """构建飞书卡片内容"""
-        return {
+    def _build_card_content(self, title: str, content: str, update_key: str = None) -> dict:
+        """构建飞书卡片内容
+
+        Args:
+            title: 卡片标题
+            content: 卡片内容（Markdown格式）
+            update_key: 更新键（用于支持多次更新）
+
+        Returns:
+            dict: 飞书卡片JSON结构
+        """
+        # 内容长度限制（飞书卡片内容最大约3000字符）
+        max_content_length = 2800
+        if len(content) > max_content_length:
+            # 截断并添加提示
+            content = content[:max_content_length] + "\n\n... (内容过长，已截断)"
+
+        card = {
             "config": {
                 "wide_screen_mode": True
             },
@@ -929,6 +1017,12 @@ class FeishuClient:
                 }
             ]
         }
+
+        # 添加update_key以支持多次更新
+        if update_key:
+            card["update_key"] = update_key
+
+        return card
 
     def create_and_send_card(self, chat_id: str, content: str, title: str = "🤖 Claude") -> Optional[str]:
         """创建并发送卡片消息到聊天，返回 message_id
@@ -953,8 +1047,12 @@ class FeishuClient:
                 "Content-Type": "application/json"
             }
 
-            # 构建卡片内容
-            card_data = self._build_card_content(title, content)
+            # 生成唯一的update_key（基于时间戳和随机数）
+            import uuid
+            update_key = f"card_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+
+            # 构建卡片内容（包含update_key）
+            card_data = self._build_card_content(title, content, update_key)
 
             payload = {
                 "receive_id": chat_id,
@@ -972,7 +1070,9 @@ class FeishuClient:
             data = response.json()
             if data.get("code") == 0:
                 message_id = data.get("data", {}).get("message_id")
-                print(f"[✅] 卡片消息已发送: {message_id}")
+                # 保存update_key用于后续更新
+                self._card_update_keys[message_id] = update_key
+                print(f"[✅] 卡片消息已发送: {message_id} (update_key: {update_key})")
                 return message_id
             else:
                 print(f"[❌] 发送卡片消息失败: {data}")
@@ -999,14 +1099,19 @@ class FeishuClient:
                 print("[错误] 获取tenant_access_token失败")
                 return False
 
+            # 获取之前保存的update_key
+            update_key = self._card_update_keys.get(message_id)
+            if not update_key:
+                print(f"[警告] 未找到卡片 {message_id} 的update_key，可能无法多次更新")
+
             url = f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}"
             headers = {
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json"
             }
 
-            # 构建卡片内容
-            card_data = self._build_card_content(title, content)
+            # 构建卡片内容（包含update_key以支持多次更新）
+            card_data = self._build_card_content(title, content, update_key)
 
             payload = {
                 "msg_type": "interactive",
@@ -1019,7 +1124,7 @@ class FeishuClient:
             if data.get("code") == 0:
                 # 序号递增（用于调试）
                 sequence = self._get_next_sequence(message_id)
-                print(f"[✅] 卡片更新成功 (序号: {sequence})")
+                print(f"[✅] 卡片更新成功 (序号: {sequence}, 内容长度: {len(content)})")
                 return True
             else:
                 print(f"[❌] 更新卡片失败: {data}")
@@ -1028,6 +1133,72 @@ class FeishuClient:
         except Exception as e:
             print(f"[错误] 更新卡片异常: {str(e)}")
             return False
+
+    def send_long_content(self, chat_id: str, content: str) -> int:
+        """分段发送长内容，自动分割成多条消息
+
+        Args:
+            chat_id: 聊天ID
+            content: 要发送的内容
+
+        Returns:
+            int: 成功发送的消息数量
+        """
+        # 飞书文本消息长度限制（约4000字符，安全值3000）
+        max_length = 3000
+        sent_count = 0
+
+        if len(content) <= max_length:
+            # 内容较短，直接发送
+            if self.send_message(chat_id, content):
+                return 1
+            return 0
+
+        # 内容过长，需要分割
+        parts = []
+        current_part = ""
+
+        # 按段落分割（保留段落结构）
+        paragraphs = content.split('\n\n')
+        current_length = 0
+
+        for para in paragraphs:
+            para_length = len(para)
+
+            if current_length + para_length + 2 <= max_length:
+                # 可以加入当前部分
+                if current_part:
+                    current_part += "\n\n" + para
+                else:
+                    current_part = para
+                current_length += para_length + 2
+            else:
+                # 当前部分已满，保存并开始新部分
+                if current_part:
+                    parts.append(current_part)
+                current_part = para
+                current_length = para_length
+
+        # 添加最后的部分
+        if current_part:
+            parts.append(current_part)
+
+        # 发送各部分
+        for i, part in enumerate(parts):
+            # 添加续接标记
+            if i > 0:
+                part = f"...（续）\n\n{part}"
+            if i < len(parts) - 1:
+                part = f"{part}\n\n...（未完待续）"
+
+            if self.send_message(chat_id, part):
+                sent_count += 1
+                # 分段之间短暂延迟，避免触发限流
+                if i < len(parts) - 1:
+                    time.sleep(0.5)
+
+        print(f"[分段] 内容已分成 {len(parts)} 部分发送，成功 {sent_count} 部")
+        return sent_count
 
 
 # ==================== 消息处理器 ====================
@@ -1578,6 +1749,12 @@ class MessageProcessor:
                             if success:
                                 self.save_processed_id(message_id)
                                 print("✅ 命令处理完成\n")
+
+                            # 如果是 clear 命令，直接退出当前批次处理
+                            if cmd_type == 'clear':
+                                print("[清理] 检测到 clear 命令，跳过当前批次剩余消息\n")
+                                break  # 退出 for 循环，不再处理已读取的其他消息
+
                             continue  # 跳过Claude CLI调用
 
                         # 设置当前chat_id的工作目录
@@ -1610,12 +1787,40 @@ class MessageProcessor:
                                 text_content,
                                 lambda c: updater.update(c),
                                 conversation_history=history,
-                                timeout=120
+                                timeout=300  # 5分钟超时（复杂查询需要联网搜索）
                             )
 
                             # 5. 最终更新
                             if response:
-                                updater.update(response)
+                                # 检查内容是否超过卡片限制
+                                card_max_length = 2800
+
+                                if len(response) <= card_max_length:
+                                    # 内容较短，用卡片完整显示
+                                    updater.force_update(response)
+                                    print(f"[✅] 卡片更新完成，内容长度: {len(response)}")
+                                else:
+                                    # 内容过长，卡片显示前半部分，剩余部分用文本消息继续发送
+                                    card_content = response[:card_max_length] + "\n\n...（内容过长，剩余部分将在下条消息继续）"
+                                    updater.force_update(card_content)
+                                    print(f"[⚠️] 内容过长（{len(response)}字符），卡片显示{card_max_length}字符，剩余部分用文本消息发送")
+
+                                    # 延迟后发送剩余内容
+                                    time.sleep(0.5)
+                                    remaining_content = response[card_max_length:]
+
+                                    # 尝试在剩余内容开头添加续接标记
+                                    # 找到合适的分割点（段落开头）
+                                    if not remaining_content.startswith('\n'):
+                                        # 如果不是从新段落开始，查找最近的段落分割
+                                        newline_pos = remaining_content.find('\n\n')
+                                        if newline_pos > 0 and newline_pos < 200:
+                                            remaining_content = remaining_content[newline_pos + 2:]
+
+                                    # 分段发送剩余内容
+                                    sent_parts = self.feishu.send_long_content(chat_id, remaining_content)
+                                    print(f"[✅] 继续发送了 {sent_parts} 条消息")
+
                                 # 保存到对话历史
                                 self.add_to_history(chat_id, "user", text_content)
                                 self.add_to_history(chat_id, "assistant", response)
@@ -1625,20 +1830,28 @@ class MessageProcessor:
                                 print("\n✅ 消息处理完成（卡片模式）\n")
                             else:
                                 # 失败时更新卡片显示错误
-                                self.feishu.update_card_message(message_id_for_card, "❌ Claude CLI调用失败")
+                                update_success = self.feishu.update_card_message(
+                                    message_id_for_card,
+                                    "❌ Claude CLI调用失败（超时或异常）\n\n请稍后重试或发送「clear」清理队列。"
+                                )
+                                if not update_success:
+                                    print("[警告] 卡片错误消息更新失败")
+
+                                # 标记为已处理，避免重复处理
+                                self.save_processed_id(message_id)
                                 print("\n❌ Claude CLI调用失败\n")
                         else:
                             # 回退到普通消息模式
                             print("[回退] 卡片创建失败，使用普通消息模式")
                             self.feishu.send_message(chat_id, "🔄 正在处理...")
 
-                            response = self.claude.chat(text_content, history, timeout=120)
+                            response = self.claude.chat(text_content, history, timeout=300)  # 5分钟超时
 
                             if response:
-                                # 发送回复到飞书
-                                success = self.feishu.send_message(chat_id, response)
+                                # 使用分段发送处理长内容
+                                sent_parts = self.feishu.send_long_content(chat_id, response)
 
-                                if success:
+                                if sent_parts > 0:
                                     # 保存到对话历史
                                     self.add_to_history(chat_id, "user", text_content)
                                     self.add_to_history(chat_id, "assistant", response)
@@ -1647,9 +1860,13 @@ class MessageProcessor:
                                     self.save_processed_id(message_id)
                                     print("\n✅ 消息处理完成（普通模式）\n")
                                 else:
-                                    print("\n❌ 发送回复失败\n")
+                                    # 发送失败，但仍标记为已处理避免重复
+                                    self.save_processed_id(message_id)
+                                    print("\n❌ 发送回复失败（已标记处理）\n")
                             else:
-                                print("\n❌ Claude CLI调用失败\n")
+                                # Claude调用失败，标记为已处理避免重复
+                                self.save_processed_id(message_id)
+                                print("\n❌ Claude CLI调用失败（已标记处理）\n")
 
                         # 短暂延迟，避免过度消耗资源
                         time.sleep(0.5)
