@@ -92,43 +92,13 @@ class CommandRouter:
     def _route_claude_mode(self, chat_id: str, message: str) -> Tuple[str, str]:
         """路由Claude模式的消息"""
         # 退出Claude模式
-        if message in ["/exit", "exit", "quit", "q"]:
+        # 退出Claude模式
+        if message in ["exit", "quit", "q"]:
             self.session_manager.close_session(chat_id)
             self.set_mode(chat_id, self.MODE_SHELL)
             return "system", "已退出 Claude 模式，返回 Shell"
 
-        # Claude会话管理命令
-        if message.startswith("/switch "):
-            session_id = message[8:].strip()
-            session = self.session_manager.get_session(chat_id)
-            if session and session.is_alive():
-                if session.switch_session(session_id):
-                    return "system", f"✅ 已切换到会话: {session_id}"
-                else:
-                    return "error", f"❌ 切换会话失败: {session_id}"
-            return "error", "❌ 没有活跃的Claude会话"
-
-        if message == "/sessions":
-            session = self.session_manager.get_session(chat_id)
-            if session and session.is_alive():
-                sessions = session.list_sessions()
-                if sessions:
-                    output = "📋 可用会话:\n\n"
-                    for i, s in enumerate(sessions, 1):
-                        output += f"{i}. {s['name']} [{s['id']}]\n"
-                    return "system", output
-                return "system", "没有可用的会话"
-            return "error", "❌ 没有活跃的Claude会话"
-
-        if message == "/new":
-            self.session_manager.close_session(chat_id)
-            working_dir = self.shell_executor.get_working_dir(chat_id)
-            self.session_manager.get_or_create_session(
-                chat_id, self.claude_cli_path, working_dir
-            )
-            return "system", "✅ 已创建新会话"
-
-        # 普通消息 -> 发送给Claude
+        # 所有消息（包括 /xxx 命令）都发送给Claude
         session = self.session_manager.get_session(chat_id)
         if session and session.is_alive():
             response = session.send_message(message, timeout=300)
@@ -136,12 +106,12 @@ class CommandRouter:
                 return "claude", response
             return "error", "❌ Claude响应超时或失败"
 
-        return "error", "❌ Claude会话未激活，发送 /claude 进入会话"
+        return "error", "❌ Claude会话未激活，发送 `claude` 进入会话"
 
     def _route_shell_mode(self, chat_id: str, message: str) -> Tuple[str, str]:
         """路由Shell模式的消息"""
         # 进入Claude模式
-        if message in ["/claude", "claude"]:
+        if message == "claude":
             self.set_mode(chat_id, self.MODE_CLAUDE)
             working_dir = self.shell_executor.get_working_dir(chat_id)
 
@@ -150,7 +120,7 @@ class CommandRouter:
                 chat_id, self.claude_cli_path, working_dir
             )
 
-            return "system", "✅ 已进入 Claude 模式\n\n发送消息开始对话，/exit 退出"
+            return "system", "✅ 已进入 Claude 模式\n\n发送消息开始对话，`exit` 退出"
 
         # 项目管理命令
         if message in ["projects", "proj", "项目"]:
@@ -222,6 +192,7 @@ class CommandRouter:
   pwd                    显示当前工作目录
   mkdir <path>           创建新目录
   <任何shell命令>        执行并返回结果
+  claude                 进入Claude交互模式
 
 📋 项目管理:
   projects / proj        列出所有项目
@@ -229,18 +200,16 @@ class CommandRouter:
   search <关键词>        搜索项目
 
 🤖 Claude 模式:
-  /claude                进入Claude交互模式
-  /switch <会话ID>       切换Claude会话
-  /sessions              列出所有会话
-  /new                   创建新会话
-  /exit                  退出Claude模式
+  普通文字               与Claude对话
+  /xxx                   Claude命令（如 /brainstorming）
+  exit                   退出Claude模式
 
 💡 使用示例:
   ls                     列出当前目录
   cd ~/projects          切换到项目目录
   projects               查看所有项目
   use openclaw           切换到openclaw项目
-  /claude                进入Claude对话
+  claude                 进入Claude对话
   """
 
     def cleanup(self, chat_id: str = None):

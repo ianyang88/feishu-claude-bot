@@ -370,8 +370,7 @@ class FeishuClient:
 
             if self.send_message(chat_id, part):
                 sent_count += 1
-                if i < len(parts) - 1:
-                    time.sleep(0.5)
+                # 不再延迟，立即发送下一段
 
         print(f"[分段] 内容已分成 {len(parts)} 部分发送，成功 {sent_count} 部")
         return sent_count
@@ -488,6 +487,9 @@ class MessageProcessor:
                         print(f"内容: {text_content}")
                         print(f"{'='*60}\n")
 
+                        import time
+                        start_time = time.time()
+
                         # 发送reaction
                         emoji_type = ReactionSelector.select_emoji_type(text_content)
                         self.feishu.send_reaction(message_id, emoji_type)
@@ -496,6 +498,9 @@ class MessageProcessor:
                         response_type, response_content = self.router.route(
                             chat_id, sender_id, text_content
                         )
+
+                        elapsed = time.time() - start_time
+                        print(f"[⏱️] 处理耗时: {elapsed:.3f}秒\n")
 
                         # 根据类型发送回复
                         if response_type == "claude":
@@ -512,9 +517,6 @@ class MessageProcessor:
                         # 标记为已处理
                         self.save_processed_id(message_id)
                         print("✅ 消息处理完成\n")
-
-                        # 短暂延迟
-                        time.sleep(0.5)
 
                     except json.JSONDecodeError as e:
                         print(f"[错误] JSON解析失败: {str(e)}")
@@ -569,7 +571,7 @@ class MessageProcessor:
         print(f"✅ 已加载 {len(self.processed_ids)} 条已处理消息记录\n")
 
         # 监控循环
-        check_interval = 1
+        check_interval = 0.1  # 100ms检查间隔，更快响应
         print(f"👀 开始监听新消息 (检查间隔: {check_interval}秒)\n")
 
         last_size = 0
