@@ -597,10 +597,17 @@ class ClaudeCLIClient:
                 print(f"[✅] Claude回复: {response[:100]}..." if len(response) > 100 else f"[✅] Claude回复: {response}")
                 return response
             else:
-                print(f"[❌] Claude CLI执行失败")
-                print(f"[错误] 返回码: {result.returncode}")
-                print(f"[stderr] {result.stderr}")
-                return None
+                # 如果有stderr输出，说明Claude CLI正常执行了，只是返回了错误
+                # 这种情况下应该把错误信息返回给用户，而不是当作"调用失败"
+                if result.stderr and result.stderr.strip():
+                    print(f"[ℹ️] Claude CLI返回错误（退出码: {result.returncode}）")
+                    print(f"[stderr] {result.stderr}")
+                    # 将stderr作为正常返回值，让用户看到实际的错误信息
+                    return result.stderr
+                else:
+                    # 没有stderr但退出码非0，这才是真正的调用失败
+                    print(f"[❌] Claude CLI调用失败（退出码: {result.returncode}，无错误输出）")
+                    return None
 
         except subprocess.TimeoutExpired:
             print(f"[❌] Claude CLI执行超时")
@@ -652,7 +659,7 @@ class ClaudeCLIClient:
             accumulated = []
             stderr_buffer = []  # 收集stderr输出，防止buffer deadlock
             last_chunk_time = time.time()
-            line_read_timeout = 120  # 单行读取超时120秒（复杂查询需要更长时间）
+            line_read_timeout = timeout  # 使用与外部相同的超时时间，避免提前判定挂起
 
             try:
                 # 使用select实现带超时的行读取，避免无限期阻塞
@@ -758,11 +765,18 @@ class ClaudeCLIClient:
                     # 使用已收集的stderr buffer，并尝试读取剩余内容
                     remaining_stderr = process.stderr.read() if not process.stderr.closed else ''
                     stderr_output = ''.join(stderr_buffer) + remaining_stderr
-                    print(f"[❌] Claude CLI执行失败")
-                    print(f"[错误] 返回码: {process.returncode}")
-                    if stderr_output:
+
+                    # 如果有stderr输出，说明Claude CLI正常执行了，只是返回了错误
+                    # 这种情况下应该把错误信息返回给用户，而不是当作"调用失败"
+                    if stderr_output.strip():
+                        print(f"[ℹ️] Claude CLI返回错误（退出码: {process.returncode}）")
                         print(f"[stderr] {stderr_output}")
-                    return None
+                        # 将stderr作为正常返回值，让用户看到实际的错误信息
+                        return stderr_output
+                    else:
+                        # 没有stderr但退出码非0，这才是真正的调用失败
+                        print(f"[❌] Claude CLI调用失败（退出码: {process.returncode}，无错误输出）")
+                        return None
 
             except subprocess.TimeoutExpired:
                 process.kill()
